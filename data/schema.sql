@@ -105,6 +105,15 @@ CREATE TABLE processing_jobs (
     attempts INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 3,
 
+    -- Phase 2: rate-limit deferrals are distinct from work failures.
+    -- defer_count tracks "rate-limited; please try later" deferrals; it does
+    -- not consume the work-attempt budget. A job that defers more than
+    -- max_defers times is moved to `dead` so a permanently-constrained
+    -- customer can't spin forever.
+    defer_count INTEGER NOT NULL DEFAULT 0,
+    max_defers INTEGER NOT NULL DEFAULT 100,
+
+
     -- Optimistic lease: a worker writes lease_token on lease, and every
     -- subsequent state transition checks WHERE lease_token = $1. A second
     -- worker that picks up the same row after lease expiry gets a different
@@ -173,6 +182,61 @@ CREATE INDEX idx_audit_events_interaction ON audit_events(interaction_id, create
 CREATE INDEX idx_audit_events_correlation ON audit_events(correlation_id, created_at);
 CREATE INDEX idx_audit_events_type ON audit_events(event_type, created_at);
 CREATE INDEX idx_audit_events_customer ON audit_events(customer_id, created_at);
+
+-- ─── Phase 2: Per-customer rate-limit budgets and token-usage ledger ───────
+-- customer_budgets defines each customer's reserved share of TPM/RPM. The
+-- sum of all reserved_tpm should be <= LLM_TOKENS_PER_MINUTE; the remainder
+-- is the global "spillover" pool that any customer can dip into after their
+-- reserved share is exhausted (see src/services/rate_limiter.py for the
+-- enforcement logic). priority_weight is used by Phase 5 backpressure to
+-- bias dispatch under contention.
+--
+-- A customer with no row here gets a default of zero reserved — they can
+-- still run, but every reservation comes from spillover and gets deprioritised.
+CREATE TABLE customer_budgets (
+    customer_id UUID PRIMARY KEY,
+    reserved_tpm INTEGER NOT NULL DEFAULT 0,
+    reserved_rpm INTEGER NOT NULL DEFAULT 0,
+    priority_weight SMALLINT NOT NULL DEFAULT 1,
+    burst_multiplier NUMERIC(4,2) NOT NULL DEFAULT 1.5,
+
+    -- Phase 3 places per-customer lane overrides here so a customer can
+    -- opt specific outcomes from cold→hot or vice versa without a deploy.
+    customer_overrides JSONB NOT NULL DEFAULT '{}',
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- token_usage is the append-only billing-grade ledger. Every LLM call
+-- writes one row with the actual usage.total_tokens from the provider's
+-- response. tokens_estimated is what the rate limiter reserved up-front;
+-- the delta (actual - estimated) is the true-up amount applied to the
+-- bucket. source distinguishes which pool the reservation came from.
+CREATE TABLE token_usage (
+    id BIGSERIAL PRIMARY KEY,
+    interaction_id UUID NOT NULL,
+    customer_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    job_id UUID NOT NULL,
+    tokens_estimated INTEGER NOT NULL,
+    tokens_actual INTEGER NOT NULL,
+    cost_micros BIGINT,
+    source VARCHAR(16) NOT NULL DEFAULT 'reserved',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_token_usage_customer_time ON token_usage(customer_id, created_at);
+CREATE INDEX idx_token_usage_interaction ON token_usage(interaction_id);
+CREATE INDEX idx_token_usage_campaign_time ON token_usage(campaign_id, created_at);
+
+-- Seed data: sample customer budgets matching the seeded customer IDs.
+-- Customer 1 (campaigns d0000000…0001): mid-tier, 30k TPM reserved.
+-- Customer 2 (campaigns d0000000…0002): smaller, 15k TPM reserved.
+-- Sum = 45k, leaving 45k spillover out of LLM_TOKENS_PER_MINUTE = 90k default.
+INSERT INTO customer_budgets (customer_id, reserved_tpm, reserved_rpm, priority_weight) VALUES
+    ('d0000000-0000-0000-0000-000000000001', 30000, 150, 2),
+    ('d0000000-0000-0000-0000-000000000002', 15000, 75, 1);
 
 -- Seed data: sample interactions for testing
 -- (Uses fixed UUIDs for reproducibility)

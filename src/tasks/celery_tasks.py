@@ -49,7 +49,7 @@ from src.services.job_store import (
     STAGE_SIGNAL_JOBS,
 )
 from src.services.post_call_processor import PostCallContext, PostCallProcessor
-from src.services.recording import fetch_and_upload_recording
+from src.services.rate_limiter import RateLimitDeferred
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,23 @@ class _SkipStage(Exception):
         super().__init__(reason)
         self.reason = reason
         self.result_payload = result_payload or {}
+
+
+def queue_for_lane(lane: Optional[str], stage: str) -> str:
+    """Map a (lane, stage) pair to the Celery queue that should service it.
+
+    Analysis is the only LLM-bound stage and the only one that benefits
+    from lane separation. signal_jobs / lead_stage are short, IO-bound,
+    and don't compete for hot-lane analysis worker slots, so they stay on
+    the default queue regardless of lane. Recording is dispatched via the
+    dedicated poller queue (Phase 4) and is not routed through this helper.
+    """
+    if stage == STAGE_ANALYSIS:
+        if lane == "hot":
+            return settings.POSTCALL_HOT_QUEUE
+        if lane == "cold":
+            return settings.POSTCALL_COLD_QUEUE
+    return settings.POSTCALL_CELERY_QUEUE
 
 
 def _worker_id() -> str:
@@ -93,6 +110,23 @@ def run_stage(self, job_id: str, stage: str) -> None:
 
 
 async def _run_stage_async(job_id: str, stage: str) -> None:
+    if stage == STAGE_RECORDING:
+        # Recording is owned by the dedicated long-lived poller (Phase 4).
+        # If a stale message routes a recording job here (e.g., a queued
+        # message from before the routing change, or a dependent dispatch
+        # that didn't special-case recording), forward without leasing so
+        # we don't burn an attempt.
+        from src.tasks.recording_poller import poll_recording
+        poll_recording.apply_async(
+            args=[str(job_id)],
+            queue=settings.RECORDING_POLL_QUEUE,
+        )
+        logger.info(
+            "stage_recording_forwarded_to_poller",
+            extra={"job_id": job_id, "stage": stage},
+        )
+        return
+
     async with async_session_factory() as session:
         leased = await job_store.lease_job(
             session, job_id=job_id, worker_id=_worker_id(),
@@ -126,10 +160,14 @@ async def _run_stage_async(job_id: str, stage: str) -> None:
     with correlation_context(interaction_id):
         try:
             payload = leased["payload"] or {}
-            if stage == STAGE_RECORDING:
-                result_payload = await _do_recording(payload)
-            elif stage == STAGE_ANALYSIS:
-                result_payload = await _do_analysis(interaction_id, payload)
+            lane = leased.get("lane")
+            if stage == STAGE_ANALYSIS:
+                result_payload = await _do_analysis(
+                    interaction_id=interaction_id,
+                    job_id=job_id,
+                    payload=payload,
+                    lane=lane,
+                )
             elif stage == STAGE_SIGNAL_JOBS:
                 result_payload = await _do_signal_jobs(
                     interaction_id, payload,
@@ -152,6 +190,23 @@ async def _run_stage_async(job_id: str, stage: str) -> None:
             )
             return
 
+        except RateLimitDeferred as deferred:
+            # Soft retry — quota wasn't available, this is not a work failure.
+            # defer_job decrements attempts to undo the lease's auto-increment;
+            # defer_count is the bound that prevents infinite spin.
+            await _finalize_deferred(
+                job_id=job_id,
+                lease_token=lease_token,
+                interaction_id=interaction_id,
+                customer_id=customer_id,
+                campaign_id=campaign_id,
+                stage=stage,
+                retry_after_seconds=deferred.retry_after_seconds,
+                reason=deferred.reason,
+                lane=lane,
+            )
+            return
+
         except Exception as exc:
             logger.exception(
                 "stage_exception",
@@ -167,6 +222,7 @@ async def _run_stage_async(job_id: str, stage: str) -> None:
                 error=str(exc),
                 attempts=leased["attempts"],
                 max_attempts=leased["max_attempts"],
+                lane=lane,
             )
             return
 
@@ -184,34 +240,31 @@ async def _run_stage_async(job_id: str, stage: str) -> None:
 # ── Stage handlers ─────────────────────────────────────────────────────────
 # Each returns the dict that becomes processing_jobs.result. Raise to fail.
 # Raise _SkipStage to skip without consuming an attempt.
-
-async def _do_recording(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Single-shot recording fetch. The asyncio.sleep(45) is gone — if the
-    recording isn't ready yet, fetch_and_upload_recording raises
-    RecordingNotReady which becomes a retried job failure (3 attempts, 60s
-    apart by default). Phase 4 replaces this with a long-lived polling
-    stage that does its own exponential backoff inside the job, avoiding
-    Celery dispatch overhead per poll.
-    """
-    s3_key = await fetch_and_upload_recording(
-        interaction_id=payload.get("interaction_id") or "",
-        call_sid=payload.get("call_sid") or "",
-        exotel_account_id=payload.get("exotel_account_id") or "",
-    )
-    return {"s3_key": s3_key}
-
+#
+# Note: the recording stage is NOT handled here. Phase 4 moved it to the
+# dedicated poller (src/tasks/recording_poller.py) so the in-job exponential
+# backoff loop avoids per-attempt Celery dispatch overhead.
 
 async def _do_analysis(
-    interaction_id: str, payload: Dict[str, Any],
+    *,
+    interaction_id: str,
+    job_id: str,
+    payload: Dict[str, Any],
+    lane: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     LLM analysis. Re-checks short-transcript at the worker (AC8) — even if
     the endpoint missed the fast path (e.g., a duplicate redelivery races
     the state), the worker won't burn LLM quota on a 3-turn transcript.
 
-    Phase 2 will wrap this with a rate-limit reservation. For now it calls
-    the LLM unconditionally (the existing mock returns a fixed result).
+    Phase 2: PostCallProcessor.process_post_call wraps the LLM call in a
+    rate-limit reservation (raises RateLimitDeferred if rejected — caught
+    by _run_stage_async and turned into a defer_job). The job_id is passed
+    through so the token_usage ledger row is keyed correctly.
+
+    Phase 3: lane controls the prompt variant and reservation hint. Cold
+    lane uses a summary-only prompt and a smaller reservation; hot lane
+    uses the full analysis prompt at default reservation size.
     """
     transcript = payload.get("conversation_data", {}).get("transcript", [])
     if len(transcript) < 4:
@@ -237,7 +290,9 @@ async def _do_analysis(
         exotel_account_id=payload.get("exotel_account_id"),
     )
     processor = PostCallProcessor()
-    result = await processor.process_post_call(ctx, single_prompt=True)
+    result = await processor.process_post_call(
+        ctx, job_id=job_id, single_prompt=True, lane=lane,
+    )
     return {
         "call_stage": result.call_stage,
         "entities": result.entities,
@@ -345,7 +400,7 @@ async def _finalize_completed(
     for dep in dependents:
         run_stage.apply_async(
             args=[str(dep["id"]), dep["stage"]],
-            queue=settings.POSTCALL_CELERY_QUEUE,
+            queue=queue_for_lane(dep.get("lane"), dep["stage"]),
         )
 
 
@@ -387,7 +442,7 @@ async def _finalize_skipped(
     for dep in dependents:
         run_stage.apply_async(
             args=[str(dep["id"]), dep["stage"]],
-            queue=settings.POSTCALL_CELERY_QUEUE,
+            queue=queue_for_lane(dep.get("lane"), dep["stage"]),
         )
 
 
@@ -402,6 +457,7 @@ async def _finalize_failed(
     error: str,
     attempts: int,
     max_attempts: int,
+    lane: Optional[str] = None,
 ) -> None:
     async with async_session_factory() as session:
         new_state = await job_store.fail_job(
@@ -437,15 +493,70 @@ async def _finalize_failed(
     if new_state == "pending":
         run_stage.apply_async(
             args=[str(job_id), stage],
-            queue=settings.POSTCALL_CELERY_QUEUE,
+            queue=queue_for_lane(lane, stage),
             countdown=settings.POSTCALL_RETRY_DELAY,
+        )
+
+
+async def _finalize_deferred(
+    *,
+    job_id: str,
+    lease_token: str,
+    interaction_id: str,
+    customer_id: str,
+    campaign_id: str,
+    stage: str,
+    retry_after_seconds: int,
+    reason: str,
+    lane: Optional[str] = None,
+) -> None:
+    """
+    Soft retry for rate-limit rejections. defer_job decrements attempts so
+    this doesn't burn the work-attempt budget; defer_count is the bound
+    that prevents infinite spin (a permanently-constrained customer's job
+    eventually goes dead after max_defers).
+    """
+    async with async_session_factory() as session:
+        new_state = await job_store.defer_job(
+            session,
+            job_id=job_id,
+            lease_token=lease_token,
+            retry_in_seconds=retry_after_seconds,
+            reason=reason,
+        )
+        if new_state is None:
+            await session.rollback()
+            return
+        await write_audit_event(
+            session,
+            interaction_id=interaction_id,
+            event_type=(
+                "stage_rate_limit_deferred"
+                if new_state == "pending"
+                else "stage_dead_defer_limit"
+            ),
+            severity="warning" if new_state == "pending" else "error",
+            stage=stage,
+            customer_id=customer_id,
+            campaign_id=campaign_id,
+            job_id=job_id,
+            reason=reason,
+            retry_after_seconds=retry_after_seconds,
+        )
+        await session.commit()
+
+    if new_state == "pending":
+        run_stage.apply_async(
+            args=[str(job_id), stage],
+            queue=queue_for_lane(lane, stage),
+            countdown=retry_after_seconds,
         )
 
 
 async def _newly_pending_dependents(session, *, parent_job_id: str):
     result = await session.execute(
         text("""
-            SELECT id, stage FROM processing_jobs
+            SELECT id, stage, lane FROM processing_jobs
             WHERE depends_on_job_id = :parent AND state = 'pending'
         """),
         {"parent": str(parent_job_id)},

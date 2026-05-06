@@ -58,6 +58,9 @@ async def create_pipeline(
     campaign_id: str | UUID,
     payload: Dict[str, Any],
     has_long_transcript: bool,
+    lane: Optional[str] = None,
+    priority: Optional[int] = None,
+    cold_defer_seconds: int = 0,
 ) -> Dict[str, UUID]:
     """
     Insert the stage rows for one interaction's pipeline in a single
@@ -73,6 +76,13 @@ async def create_pipeline(
     For short transcripts, analysis is created in `skipped` state and
     signal_jobs/lead_stage are created in `pending` state directly (no
     dependency to wait on).
+
+    Phase 3: lane/priority drive scheduling. Hot lane sets priority=1 so
+    the row is leased ahead of cold-lane backlog at the same stage. Cold
+    lane sets priority=9 and pushes the analysis stage's scheduled_at by
+    `cold_defer_seconds` so cold work yields to hot under contention. The
+    lane label is persisted on every row so the worker can route to
+    lane-specific Celery queues at dispatch time.
     """
     interaction_uuid = str(interaction_id)
     customer_uuid = str(customer_id)
@@ -89,14 +99,19 @@ async def create_pipeline(
     )
     dependents_depends_on = analysis_id if has_long_transcript else None
 
+    effective_priority = priority if priority is not None else 5
+
     insert_sql = text("""
         INSERT INTO processing_jobs
             (id, interaction_id, customer_id, campaign_id,
-             stage, state, payload, result, depends_on_job_id, scheduled_at)
+             stage, state, payload, result, depends_on_job_id,
+             scheduled_at, priority, lane)
         VALUES
             (:id, :interaction_id, :customer_id, :campaign_id,
              :stage, :state, cast(:payload as jsonb),
-             cast(:result as jsonb), :depends_on, NOW())
+             cast(:result as jsonb), :depends_on,
+             NOW() + (:scheduled_offset_s || ' seconds')::interval,
+             :priority, :lane)
         ON CONFLICT (interaction_id, stage) DO NOTHING
         RETURNING id, stage
     """)
@@ -110,6 +125,15 @@ async def create_pipeline(
         else {"call_stage": "short_call", "skipped": True}
     )
 
+    # Cold-lane defer applies only to the LLM-bound analysis stage.
+    # Recording fetch and downstream signal_jobs/lead_stage do not get
+    # pushed because they're not the bottleneck — the analysis stage is.
+    cold_offset = (
+        cold_defer_seconds
+        if (lane == "cold" and cold_defer_seconds > 0)
+        else 0
+    )
+
     rows_to_insert = [
         {
             "id": str(recording_id),
@@ -117,6 +141,7 @@ async def create_pipeline(
             "state": STATE_PENDING,
             "depends_on": None,
             "result": None,
+            "scheduled_offset_s": 0,
         },
         {
             "id": str(analysis_id),
@@ -124,6 +149,7 @@ async def create_pipeline(
             "state": analysis_initial_state,
             "depends_on": None,
             "result": skipped_analysis_result,
+            "scheduled_offset_s": cold_offset,
         },
         {
             "id": str(signal_id),
@@ -131,6 +157,7 @@ async def create_pipeline(
             "state": dependents_initial_state,
             "depends_on": str(dependents_depends_on) if dependents_depends_on else None,
             "result": None,
+            "scheduled_offset_s": 0,
         },
         {
             "id": str(lead_stage_id),
@@ -138,6 +165,7 @@ async def create_pipeline(
             "state": dependents_initial_state,
             "depends_on": str(dependents_depends_on) if dependents_depends_on else None,
             "result": None,
+            "scheduled_offset_s": 0,
         },
     ]
 
@@ -161,6 +189,9 @@ async def create_pipeline(
                     else None
                 ),
                 "depends_on": row["depends_on"],
+                "priority": effective_priority,
+                "lane": lane,
+                "scheduled_offset_s": str(row["scheduled_offset_s"]),
             },
         )
         returned = result.first()
@@ -216,7 +247,7 @@ async def lease_job(
               )
             RETURNING id, interaction_id, customer_id, campaign_id, stage,
                       state, attempts, max_attempts, lease_token, payload,
-                      depends_on_job_id
+                      depends_on_job_id, lane, priority
         """),
         {
             "new_token": str(new_token),
@@ -267,7 +298,7 @@ async def lease_next(
             )
             RETURNING id, interaction_id, customer_id, campaign_id, stage,
                       state, attempts, max_attempts, lease_token, payload,
-                      depends_on_job_id
+                      depends_on_job_id, lane, priority
         """),
         {
             "new_token": str(new_token),
@@ -384,6 +415,57 @@ async def fail_job(
     return row.state
 
 
+async def defer_job(
+    session: AsyncSession,
+    *,
+    job_id: str | UUID,
+    lease_token: str | UUID,
+    retry_in_seconds: int,
+    reason: str,
+) -> Optional[str]:
+    """
+    Soft retry — the worker leased the job but couldn't proceed because of
+    a transient external constraint (e.g., rate-limit reservation rejected).
+    This is NOT a work failure: attempts is decremented to undo the lease's
+    auto-increment, and defer_count is incremented instead. A job that
+    defers more than max_defers times is moved to `dead` so a customer
+    permanently outside their quota doesn't spin forever.
+
+    Returns the new state ('pending' on successful defer, 'dead' if defer
+    budget is exhausted) or None if the lease check failed.
+    """
+    result = await session.execute(
+        text("""
+            UPDATE processing_jobs
+            SET state = CASE
+                    WHEN defer_count + 1 >= max_defers THEN 'dead'
+                    ELSE 'pending'
+                END,
+                defer_count = defer_count + 1,
+                attempts = GREATEST(0, attempts - 1),
+                last_error = :reason,
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                scheduled_at = NOW() + (:retry_in_seconds || ' seconds')::interval,
+                updated_at = NOW()
+            WHERE id = :job_id
+              AND lease_token = :lease_token
+              AND state = 'leased'
+            RETURNING state
+        """),
+        {
+            "reason": reason[:8000],
+            "retry_in_seconds": str(retry_in_seconds),
+            "job_id": str(job_id),
+            "lease_token": str(lease_token),
+        },
+    )
+    row = result.first()
+    if row is None:
+        return None
+    return row.state
+
+
 async def mark_skipped(
     session: AsyncSession,
     *,
@@ -455,6 +537,34 @@ async def get_job(
     )
     row = result.first()
     return _row_to_dict(row._mapping) if row else None
+
+
+async def get_customer_overrides(
+    session: AsyncSession,
+    *,
+    customer_id: str | UUID,
+) -> Dict[str, Any]:
+    """
+    Return the customer_overrides JSONB map for a customer (Phase 3).
+    Empty dict if the customer has no row in customer_budgets.
+    Failure-tolerant: a missing customer_budgets table or a row miss
+    yields {} rather than raising, so triage stays in the API hot path.
+    """
+    try:
+        result = await session.execute(
+            text("""
+                SELECT customer_overrides
+                FROM customer_budgets
+                WHERE customer_id = :customer_id
+            """),
+            {"customer_id": str(customer_id)},
+        )
+    except Exception:
+        return {}
+    row = result.first()
+    if row is None or row.customer_overrides is None:
+        return {}
+    return dict(row.customer_overrides)
 
 
 async def reap_stale_leases(session: AsyncSession) -> int:
