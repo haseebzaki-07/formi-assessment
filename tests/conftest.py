@@ -12,6 +12,23 @@ from datetime import datetime
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+# pytest-asyncio in auto mode creates a fresh event loop for each test.
+# The module-level AsyncEngine in src.utils.db caches connections in a
+# pool that's bound to whichever loop first opened them; subsequent tests
+# trying to reuse the pool from a different loop fail with asyncpg's
+# "cannot perform operation: another operation is in progress" — and
+# trying to *close* those stale connections raises NoneType.send. Discard
+# the pool with close=False so each test allocates fresh connections in
+# its own loop without the test runner trying to drive cleanup against a
+# dead loop.
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_async_engine():
+    from src.utils import db as _db
+    await _db.engine.dispose(close=False)
+    yield
+    await _db.engine.dispose(close=False)
+
+
 @pytest.fixture
 def sample_transcripts():
     with open(FIXTURES_DIR / "sample_transcripts.json") as f:
