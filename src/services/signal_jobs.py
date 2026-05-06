@@ -7,20 +7,12 @@ Examples of what runs here in production:
   - Push the call outcome to the customer's CRM via webhook
   - Flag the interaction for human review if the lead was angry
 
-These are the actions the business actually cares about. Getting the analysis
-done is only valuable if these downstream triggers fire correctly and durably.
-
-Current execution model: asyncio.create_task() in the FastAPI event loop.
-  - Fire-and-forget with no return value
-  - No retry if the downstream service is down
-  - No record that it was attempted
-  - Lost entirely if the FastAPI server restarts while the task is pending
-
-There's a subtler timing problem too: for long transcripts, signal_jobs is
-called twice — once from the endpoint (before Celery runs, with an empty
-analysis_result) and once from the Celery task (after analysis, with the real
-result). Downstream systems receive two triggers: one empty, one real.
-Whether they handle that gracefully depends on the downstream system.
+Phase 1 made these durable stages: the worker pipeline owns invocation
+through processing_jobs. The endpoint no longer fires duplicate
+empty-payload triggers, and a worker crash mid-dispatch leaves the row
+in `leased` state so the stale-lease reaper recovers it. The CRM-push
+retry contract (deferred nice-to-have, see SUBMISSION.md §14) would
+extend these handlers with per-action attempt tracking.
 """
 
 import logging
@@ -38,13 +30,10 @@ async def trigger_signal_jobs(
     """
     Dispatch downstream actions based on the call analysis.
 
-    analysis_result contains call_stage and entities from the LLM.
-    When called from the endpoint (before Celery), analysis_result is {}.
-    When called from the Celery task, analysis_result has the real data.
-
-    In production, this fans out to multiple downstream services based on
-    campaign configuration. Each dispatch is currently fire-and-forget with
-    no ack, no retry, and no record in the database.
+    analysis_result is read from the parent analysis stage's result column
+    (see celery_tasks._read_analysis_result), so the payload the worker
+    sees is always the LLM's actual output (or the short-call fallback)
+    rather than a stale snapshot.
     """
     logger.info(
         "signal_jobs_triggered",
@@ -71,12 +60,7 @@ async def update_lead_stage(
       "rebook_confirmed" → "booked"
       "not_interested"   → "closed_lost"
       "callback_requested" → "follow_up"
-      "processing"       → (placeholder, overwritten when analysis completes)
-
-    For long transcripts, this is called twice: once from the endpoint with
-    call_stage="processing", once from Celery with the real stage. The second
-    write overwrites the first — which is fine, but it means the lead briefly
-    appears as "processing" in the dashboard even after the call ended cleanly.
+      "short_call"       → unchanged (no business signal from the call)
     """
     logger.info(
         "lead_stage_updated",

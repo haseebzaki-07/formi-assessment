@@ -23,7 +23,7 @@ There is no linter or formatter configured. The existing tests in `tests/test_po
 
 ## Implementation status
 
-Work is being done in phases (see plan file). **Phases 1–5 have landed.** The sections below describe the *original* broken architecture for context; the bullets here describe what's actually in the tree right now.
+Work is being done in phases (see plan file). **Phases 1–6 have landed; the implementation is complete against the brief.** The sections below describe the *original* broken architecture for context; the bullets here describe what's actually in the tree right now.
 
 - `processing_jobs` and `audit_events` tables exist (in `data/schema.sql`); they're the durable source of truth for pipeline state, not the Celery broker.
 - `src/services/job_store.py` is the repository layer (`create_pipeline`, `lease_job`, `lease_next`, `complete_job`, `fail_job`, `defer_job`, `mark_skipped`, `reap_stale_leases`). Idempotency is on `(interaction_id, stage)`; the conditional UPDATE with `lease_token` makes late completions from crashed workers a no-op.
@@ -36,8 +36,9 @@ Work is being done in phases (see plan file). **Phases 1–5 have landed.** The 
 - `src/services/triage.py` (Phase 3): keyword/regex stage A + cheap-LLM stage B; the `lane` and `priority` columns on `processing_jobs` route work to `postcall_hot`, `postcall_cold`, or the default queue.
 - `src/services/backpressure.py` (Phase 5): continuous `current_utilization()` from the rate-limiter's global aggregate counters; smooth `dialler_dispatch_probability` curve (1 − sigmoid centred at 0.7 utilisation). `src/services/circuit_breaker.py` is **deleted** — the binary 1800s freeze is gone.
 - `src/api/metrics.py` (Phase 5): Prometheus `/metrics` endpoint exposing `llm_utilization`, `dialler_dispatch_probability`, raw TPM/RPM aggregates, and per-`(customer_id, state)` queue depth.
+- Phase 6: `tests/test_post_call_pipeline.py` (replaces the old `test_post_call.py` that documented broken behaviour), `tests/test_burst_load.py` (concurrent-pipeline invariants), `tests/test_acceptance_criteria.py` (one test per AC1–AC10 — grep-able rubric surface). `src/services/metrics.py` (the dead `PostCallMetricsTracker`) is **deleted**; signal_jobs docstrings refreshed. SUBMISSION.md sections 9–15 (auditability, data model migration, security, API interface, trade-offs, known weaknesses, what I'd do with more time) are written out.
 
-Remaining work: test polish + SUBMISSION.md finalisation (Phase 6). The endpoint's `_load_interaction` / `_update_interaction_status` are wired to Postgres now (Phase 0/1).
+The endpoint's `_load_interaction` / `_update_interaction_status` are wired to Postgres (Phase 0/1).
 
 ## Architecture (current, broken)
 

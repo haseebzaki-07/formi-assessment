@@ -513,50 +513,249 @@ The current `data/schema.sql` is loaded by `docker-compose` on init from a fresh
 
 ## 9. Auditability & Observability
 
-_Detail in Phase 6. Summary placeholder: every error path emits a structured log via `src/utils/logging.py` with `interaction_id` as `correlation_id`. The `audit_events` table is the durable record; canonical query is `SELECT event_type, severity, details FROM audit_events WHERE interaction_id = $1 ORDER BY created_at`._
+The on-call test for this system is: **3 days after a customer reports "interaction X never showed up in the dashboard", an engineer who has never seen this interaction before can reconstruct what happened from the durable record using `interaction_id` as the only handle.** Every design decision in this section flows from that test.
+
+### What gets logged
+
+Two surfaces, with different durability guarantees:
+
+| Surface | Mechanism | Durability | Use |
+|---|---|---|---|
+| **Application logs** | `src/utils/logging.py::JsonFormatter` over stdout, keyed by `correlation_id = interaction_id` (set by `correlation_context(...)` contextvar — every log call inside the block auto-injects it without the caller threading anything through) | Best-effort. Stdout → log shipper → search index. Lost on shipper failure. | High-volume, low-importance — every step the worker takes. Useful for detail; not the source of truth. |
+| **`audit_events` table** | `write_audit_event(...)` writes a row in the **caller's transaction**, so the audit row and the state change land atomically — there is no audit-vs-state divergence on crashes. | Durable. Append-only Postgres. | Pipeline state-transition log — the source of truth for "what happened to this interaction". |
+
+`correlation_context(interaction_id)` is wrapped around every worker entry point (`_run_stage_async` in `src/tasks/celery_tasks.py`, `_poll_recording_async` in `src/tasks/recording_poller.py`, the FastAPI endpoint handler). Every log line and every audit-event row from inside the block carries the same `correlation_id`. A scrape across the whole system can be filtered by interaction_id without coordination.
+
+### The canonical debug query
+
+> "Interaction `e4b3...` looks broken. What happened?"
+
+```sql
+SELECT created_at, event_type, severity, stage, details, customer_id
+FROM audit_events
+WHERE interaction_id = 'e4b3...'
+ORDER BY created_at;
+```
+
+This single query reconstructs the timeline from `pipeline_created` through every `stage_leased` / `stage_completed` / `stage_failed_will_retry` / `stage_rate_limit_deferred` / `recording_poll_attempt` / `stage_dead`, with a `details` JSONB carrying the per-event context (which worker, which attempt, what error string, what reservation source, retry-after seconds, etc.). Nothing is implicit.
+
+The supporting indexes are in `data/schema.sql`:
+
+- `idx_audit_events_interaction (interaction_id, created_at)` — this query.
+- `idx_audit_events_correlation (correlation_id, created_at)` — same query when correlation diverges from interaction (rare; reserved for cross-interaction joins).
+- `idx_audit_events_type (event_type, created_at)` — for "how many `recording_failed_terminal` rows last hour" alerts.
+- `idx_audit_events_customer (customer_id, created_at)` — for per-customer dashboards.
+
+### Other useful query patterns
+
+| Question | Query |
+|---|---|
+| What's stuck in `pending` right now? | `SELECT customer_id, stage, COUNT(*) FROM processing_jobs WHERE state = 'pending' GROUP BY customer_id, stage;` |
+| Per-customer LLM spend in the last hour | `SELECT customer_id, SUM(tokens_actual) FROM token_usage WHERE created_at > NOW() - INTERVAL '1 hour' GROUP BY customer_id;` |
+| Recording terminal-failure rate | `SELECT customer_id, COUNT(*) FROM audit_events WHERE event_type='recording_failed_terminal' AND created_at > NOW() - INTERVAL '1 hour' GROUP BY customer_id;` |
+| Worker churn signal | `reaped_stale_leases` log lines per hour (`celery beat` runs the reaper every 30s and logs the reaped count). |
+
+### Live operational signals
+
+Phase 5's `/metrics` endpoint (`src/api/metrics.py`) exposes the live numbers as Prometheus gauges: `llm_utilization`, `dialler_dispatch_probability`, `llm_tokens_used_minute` / `llm_requests_used_minute`, `postcall_jobs{customer_id, state}`. Alert thresholds documented in §4.
+
+### What this validates from the rubric
+
+- **AC5** — every interaction has a complete audit trail; the canonical query above returns one row per state transition.
+- **AC6** — every error path emits a structured log carrying `interaction_id` as `correlation_id`. The contextvar approach makes "every call carries the id" structural rather than discipline-dependent.
 
 ---
 
 ## 10. Data Model
 
-_See Section 8 above._
+The full schema lives in `data/schema.sql` and is loaded into Postgres on `docker-compose up -d` from a fresh `pgdata` volume. Section 8 above carries the table-level reference; this section covers the migration path and what changed at each phase.
+
+### What this redesign added (vs. the original schema)
+
+| Phase | Tables / columns added | Why |
+|---|---|---|
+| Phase 1 | `processing_jobs` (full table), `audit_events` (full table) | Durable pipeline state + append-only audit trail. |
+| Phase 2 | `customer_budgets` (full table), `token_usage` (full table), `processing_jobs.defer_count` / `max_defers` | Per-customer reserved capacity, billing-grade ledger, distinct soft-retry counter for rate-limited jobs. |
+| Phase 3 | `processing_jobs.priority` / `lane`, `customer_budgets.customer_overrides` | Hot/cold routing + per-customer no-deploy disposition overrides. |
+| Phase 4 | (none — `processing_jobs` already had what it needed) | The recording poller is purely a worker-loop change. |
+| Phase 5 | (none) | Backpressure reads existing Redis counters. |
+
+Existing tables (`leads`, `sessions`, `interactions`) are unchanged in surface area. `interactions.interaction_metadata` JSONB continues to serve as the dashboard's hot cache and is updated atomically with the `token_usage` ledger row in `process_post_call`.
+
+### Migration path
+
+The local development workflow re-initialises the schema with `docker-compose down -v && docker-compose up -d`. In production this would be split into versioned migrations (Alembic or equivalent). Each addition is **non-destructive and online-applicable**:
+
+- Adding new tables (`processing_jobs`, `audit_events`, `customer_budgets`, `token_usage`) is `CREATE TABLE` + `CREATE INDEX` — locks are short and per-table. No existing reads or writes touch these.
+- Adding columns (`processing_jobs.priority`, `lane`, `defer_count`, `max_defers`; `customer_budgets.customer_overrides`) is `ALTER TABLE … ADD COLUMN` with defaults. On Postgres 11+ this is a metadata-only operation for nullable columns and columns with constant defaults — no full table rewrite, no row lock.
+
+The order of migrations corresponds to the phase order. Each phase's tests run green against the previous phase's schema plus that phase's additions.
+
+### Idempotency at the schema level
+
+`uq_processing_jobs_interaction_stage UNIQUE (interaction_id, stage)` is the load-bearing idempotency guarantee. A duplicate webhook delivery hits this constraint and the `ON CONFLICT (interaction_id, stage) DO NOTHING` in `create_pipeline` makes the second attempt a no-op without surfacing an error. This is structural, not procedural — there is no "have I seen this interaction before?" check anywhere in application code.
 
 ---
 
 ## 11. Security
 
-_Detail in Phase 6. Summary placeholder: transcript and recording are PII-bearing; encryption-at-rest is a deferred nice-to-have with the hooks needed to add it (separate KMS key per customer, recording S3 bucket SSE-KMS, transcripts encrypted in `interactions.conversation_data` via column-level pgcrypto)._
+### What's sensitive
+
+The system handles three classes of sensitive data, each with its own protection requirement:
+
+| Data | Where it lives | Sensitivity |
+|---|---|---|
+| **Call transcripts** | `interactions.conversation_data` JSONB; `processing_jobs.payload` JSONB (snapshot per pipeline) | Spoken PII (names, phone numbers, addresses, sometimes payment / health details). The richest single PII surface in the system. |
+| **Lead PII** | `leads.name`, `leads.phone`, `leads.email`, `leads.lead_data` JSONB | Direct identifiers, regulated under data-protection law (DPDP / GDPR / equivalent). |
+| **Recording audio** | S3 bucket (`S3_BUCKET`); URL stored in `interactions.recording_url`, `interactions.recording_s3_key` | Same content as transcripts, in audio form. Voice biometrics are themselves PII in some jurisdictions. |
+| **LLM prompts and responses** | Transient (logged at debug level only); not persisted in full | Contains transcript text. Treated as transcripts for handling. |
+| **Audit events** | `audit_events.details` JSONB | Carries small bits of context (event type, attempt number) — does **not** copy transcripts or PII fields. |
+
+### Strategy in place today
+
+- **No transcripts in audit logs.** `_safe_summary(...)` in `src/tasks/celery_tasks.py` strips large fields out of `audit_events.details` (the raw LLM response can carry ~1500 tokens of transcript context). Audit rows keep stable, non-PII fields: `call_stage`, `tokens_used`, `latency_ms`, `s3_key`, `skipped`. The full LLM response stays in `processing_jobs.result`, where access is gated through Postgres role grants.
+- **No transcripts in application logs.** The structured logger never emits transcript text — the worker log lines carry `interaction_id`, stage names, and counts. Anyone with log access cannot reconstruct call content.
+- **No transcripts in `/metrics`.** The Prometheus endpoint emits aggregates only; cardinality is bounded by `customers × states`.
+- **Postgres on a private network.** Per the deployment assumption (§1, item 7), Postgres is reachable only from the application network. Connection strings carry credentials and live in environment variables, not source control.
+- **TLS everywhere in transit.** Webhook receipt (HTTPS), Postgres (TLS), Redis (TLS), Exotel API (HTTPS), LLM provider (HTTPS), S3 (TLS).
+
+### Encryption at rest — deferred, with hooks
+
+Encryption at rest is the principal "nice-to-have" item the brief calls out, and it is deferred from this implementation. The hooks needed to add it without rewriting are:
+
+- **Recording artefacts (S3).** Switch the recording S3 bucket to SSE-KMS with a per-customer KMS key. The recording S3 key already incorporates `customer_id` (`{customer_id}/{interaction_id}.mp3` is the production layout); the upload path passes `customer_id` so attaching `ServerSideEncryption=aws:kms, SSEKMSKeyId=...` is a single config addition in `src/services/recording.py::upload_recording_to_s3`. No application reads the raw bytes — only signed URLs are handed to dashboards.
+- **Transcripts and lead PII (Postgres).** Column-level encryption via `pgcrypto`'s symmetric envelope (`pgp_sym_encrypt(...)` / `pgp_sym_decrypt(...)`) over `interactions.conversation_data` and `leads.lead_data`. The encryption key is fetched from a KMS at app start and held in process memory, never written to disk. Adding this requires touching: (a) the schema (no column type change — `bytea` instead of `jsonb` for the encrypted blob, with a thin view restoring the JSONB shape on read), (b) the load/store paths in `src/api/endpoints.py` and `src/services/post_call_processor.py`, (c) operational tooling for key rotation. This is real work, hence deferred.
+- **Backups.** Postgres logical backups would inherit the encrypted-column ciphertext directly. Physical backups of the data volume already get OS-level encryption from the cloud provider's disk encryption.
+
+### Access patterns
+
+- The dashboard reads `interaction_metadata` (analysis result, dashboard cache) — no direct PII; transcript text is fetched only on operator drill-down through a separate authenticated endpoint (out of scope for this assessment).
+- The on-call audit query (§9) reads `audit_events` — by design, no transcript data lives there.
+- Billing reads `token_usage` — counts and source labels only, no transcripts.
+
+### Secrets handling
+
+The LLM provider key, Exotel credentials, S3 credentials, and database credentials are environment variables. The mock `LLM_API_KEY = "sk-mock-key-for-assessment"` in `src/config.py` exists only for the tests; production deployments inject the real value via the secret manager. Nothing in the source tree references the real key directly.
+
+### What this validates from the rubric
+
+- **AC10** — sensitive data is identified explicitly (transcripts, recordings, lead PII) and the protection strategy covers in-transit (TLS), at-rest-today (no PII in logs / audit / metrics), and at-rest-future (KMS / pgcrypto hooks documented for the deferred encryption work).
 
 ---
 
 ## 12. API Interface
 
-_Detail in Phase 6. Summary placeholder: webhook contract `POST /session/{sid}/interaction/{iid}/end` is unchanged externally. Internally, the duplicate empty-payload `signal_jobs` / `update_lead_stage` calls that ran from this endpoint with `analysis_result={}` were removed in Phase 0/1; both are now durable stages owned by the worker pipeline._
+### Externally — unchanged
+
+```
+POST /session/{session_id}/interaction/{interaction_id}/end
+Content-Type: application/json
+
+{
+  "call_sid": "exotel-call-001",
+  "duration_seconds": 180,
+  "call_status": "completed",
+  "additional_data": {…}
+}
+
+200 OK
+{
+  "status": "ok",
+  "interaction_id": "f0000000-...",
+  "message": "Interaction ended, durable pipeline created"
+}
+```
+
+The shape on the wire is identical to what the telephony provider sent before this redesign. No customer integration needs to change.
+
+### Internally — the contract changed
+
+What the endpoint promises has shifted from "best-effort, fire-and-forget" to **"the pipeline is durable before this 200 returns"**.
+
+**Before:**
+1. The endpoint optionally fired `signal_jobs` and `update_lead_stage` from `asyncio.create_task` with `analysis_result={}` (an empty payload), then scheduled a Celery task and returned. If the FastAPI process restarted in between, the in-memory tasks were lost. If Celery's Redis broker was down, the task was lost. Downstream services received duplicate triggers (one empty, one real). No record was kept.
+2. The 200 meant nothing about durability.
+
+**Now:**
+1. The endpoint runs `triage.classify` over the transcript inside the request handler.
+2. In a single Postgres transaction: it `UPDATE`s `interactions.status = 'ENDED'`, `INSERT`s the four `processing_jobs` rows for this interaction's pipeline (`recording`, `analysis`, `signal_jobs`, `lead_stage`), and `INSERT`s a `pipeline_created` row in `audit_events`. Either everything lands or nothing does.
+3. After commit, the endpoint dispatches the entry-point Celery messages — `poll_recording.apply_async` for the recording stage and `run_stage.apply_async` for the analysis stage (or directly for `signal_jobs` / `lead_stage` if the transcript is short).
+4. The 200 means: the durable pipeline rows exist in Postgres. Even if every Celery worker crashes immediately, the rows remain and will be picked up by the stale-lease reaper / reconciler / a fresh worker.
+
+The duplicate empty-payload `signal_jobs` and `update_lead_stage` calls that ran from the long-transcript branch with `analysis_result={}` are gone. Both are now durable stages owned by the worker pipeline; the worker reads the parent's analysis result via `depends_on_job_id` rather than receiving a (possibly stale) snapshot.
+
+### Idempotency on the wire
+
+A duplicate webhook delivery for the same `interaction_id` hits `uq_processing_jobs_interaction_stage` and the `ON CONFLICT (interaction_id, stage) DO NOTHING` path in `create_pipeline` returns the existing IDs unchanged. The endpoint returns 200 to both deliveries; downstream sees one pipeline.
+
+### `/metrics` endpoint (Phase 5, new)
+
+```
+GET /metrics
+200 OK
+Content-Type: text/plain; version=0.0.4
+
+# HELP llm_utilization …
+# TYPE llm_utilization gauge
+llm_utilization 0.412345
+…
+postcall_jobs{customer_id="...", state="pending"} 27
+…
+```
+
+Prometheus exposition format. No auth — runs behind the cluster's network policy. Exposing it externally would leak per-customer queue depth, which is mildly sensitive.
+
+### What's deliberately not part of the API
+
+- **No "get analysis result" endpoint.** The dashboard reads `interactions.interaction_metadata` directly (the existing pattern); adding a separate endpoint would duplicate the source of truth.
+- **No status query endpoint per interaction.** The audit-events query (§9) is the support-engineer interface; we'd build a thin operator UI over that query if/when an external customer needs it.
 
 ---
 
 ## 13. Trade-offs & Alternatives Considered
 
-_Detail in Phase 6._
-
-| Option | Why Considered | Why Rejected / What You Chose Instead |
-|--------|---------------|--------------------------------------|
-| _to be filled in_ | _per phase_ | _per phase_ |
+| Option considered | Why it was tempting | Why we chose otherwise |
+|---|---|---|
+| **Kafka as the durable substrate** instead of Postgres `processing_jobs` | Kafka's natural at-least-once + ordered-per-key delivery is a clean fit for "one interaction, one pipeline, one progress stream". Higher throughput than Postgres for write-heavy workloads. | Operational cost. Adding Kafka means adding a Kafka cluster, schema registry, consumer-offset management, and a separate alerting surface. Postgres is already in the stack; the working set fits comfortably (100K calls × 4 stages = 400K rows per campaign — trivial for a single Postgres instance). The `FOR UPDATE SKIP LOCKED` lease query handles concurrent workers correctly. We pay an extra millisecond per state transition vs. Kafka in exchange for not running another stateful service. |
+| **Sidecar rate limiter** (Envoy + a token-bucket plugin, or a dedicated rate-limit microservice) | Rate-limit logic out of application code; reusable across services. | Coordinating per-customer reserved + spillover with a sidecar requires replicating the data model into the sidecar's config. The Lua-in-Redis approach co-locates the policy with the counters and runs as a single atomic op — no plugin / RPC. The trade-off accepted is that this rate limiter is voicebot-specific; if a second service ever needs the same shape, we'd extract it. |
+| **Per-customer Celery queues** (one queue per customer) for AC2's isolation guarantee | Topology-level guarantee — Customer A's queue can never starve Customer B's. | Queue cardinality scales with customer count; at 100+ customers operators are managing 100+ queue specs. The reservation-counter approach gives the same structural guarantee (Customer A's reserved counter is a different Redis key from Customer B's) without the topology cost. Confirmed by `tests/test_rate_limiter.py::test_customer_a_burst_does_not_consume_customer_b_reserved`. |
+| **Synchronous LLM calls in the endpoint** (no Celery) | Simpler architecture, fewer moving parts. The endpoint blocks until analysis completes. | The webhook has a 5-second response timeout. LLM calls take 1–10 seconds. A burst of 100K calls would saturate the API process pool while waiting. Decoupling the request response from the work is structural, not optional. |
+| **Per-attempt Celery redelivery for the recording poll** | Simpler — each retry is a fresh Celery message; the broker handles scheduling. | At 100K calls × 5 attempts in the slow case = 500K extra dispatches. Each carries a broker round-trip plus a lease acquire/release plus an audit-row write. Phase 4's in-job loop runs the entire backoff schedule inside one leased job, with the lease sized to cover the full schedule. Same durability (lease expiry → reconciler), much less overhead. |
+| **Retry-After header → `time.sleep(N)` inside the worker** for provider 429s | Simplest possible retry. | A worker holding the lease while sleeping 30s blocks one worker slot. Multiplying by burst, the worker pool gets gridlocked on sleeps. The chosen approach `defer_job(retry_in_seconds=...)` releases the lease and lets the row be re-leased after `scheduled_at` passes — workers stay productive on other jobs. |
+| **A binary breaker + a "half-open" probing state** (the conventional circuit-breaker pattern) | Recover from breaker-open without manually opening. | The whole point of replacing the breaker (Phase 5) was to remove the bistability. A continuous shed curve has no "open" state to recover from — utilisation drops, dispatch probability rises. Fewer states to reason about, no probing logic to misjudge. |
+| **Triage as a small-LLM call only** (skip the keyword stage) | Higher accuracy ceiling than regex; one mental model instead of two. | At ~50 tokens per Stage B call × 100K calls = 5M tokens just for triage. Stage A handles >90% of the fixture corpus deterministically in <1ms; Stage B only fires on the ambiguous ones. Cost and latency win. |
+| **Encrypt PII at rest by default** in this implementation | Compliance posture stronger out of the gate. | The plumbing is non-trivial: pgcrypto symmetric envelopes, KMS bootstrap, key rotation, performance impact on JSONB queries that the dashboard depends on. Section 11 documents the hooks; deferred to keep AC1–AC10 verifiable on a clean environment. Honest about the trade-off rather than hiding it. |
 
 ---
 
 ## 14. Known Weaknesses
 
-_Detail in Phase 6. Will include:_
-- Encryption at rest (deferred nice-to-have).
-- CRM push retry (deferred nice-to-have).
-- Per-customer no-deploy config UI (deferred nice-to-have).
-- Triage classifier accuracy on the `hinglish_ambiguous` case — small-LLM fallback adds latency that may push some hot-lane calls into the 60s commitment window. Trade-off documented in Phase 3.
+Items the design is aware of but did not fix in this iteration. Each is a concrete follow-up, not a wishlist.
+
+1. **Encryption at rest is not implemented.** Hooks documented in §11 (S3 SSE-KMS for recordings, pgcrypto column-level for transcripts and lead PII). Deferred — see §13's last row.
+2. **CRM push retry / status tracking is not implemented.** `signal_jobs.trigger_signal_jobs` is durable at the *stage* level (it runs inside `processing_jobs.signal_jobs`), but a partial failure across the fan-out (e.g., WhatsApp succeeded, CRM failed) is not separately tracked. The fix is a `signal_action_attempts` table keyed by `(interaction_id, action_kind)` with the same lease/retry semantics as `processing_jobs`. Same shape as Phase 1, just at the action level.
+3. **Per-customer no-deploy config UI is not implemented.** Customer overrides live in `customer_budgets.customer_overrides` JSONB and are read by the triage call; a customer-facing UI to edit this would require an admin authn/authz surface and audit logging on the writes. Deferred.
+4. **Triage Stage B latency on the hot-by-tone case.** A "considering" hinglish transcript routes through Stage B (~50 token / ~200ms LLM call) before it reaches the analysis stage. If the customer turns out to be hot, this adds latency. The "60-second hot end-to-end" commitment from §1 absorbs this comfortably for a single call; we have not stress-tested it under burst when both Stage A and Stage B are saturated. Documented in §6.
+5. **Spillover prioritisation is first-come-first-served.** Two customers both bursting into spillover get whichever's reservation hits the Lua script first. `customer_budgets.priority_weight` is read by Phase 5 backpressure for *dialler* prioritisation, not by the rate limiter for *reservation* prioritisation. Adding weighted draws to the Lua script is straightforward but increases its complexity; deferred until contention is observed in production.
+6. **Global counter mutual divergence on worker crash.** The Phase 5 global TPM counter is incremented inside the reservation Lua script atomically, but is decremented from Python in `refund` / `refund_tokens`. A worker that crashed *after* the script ran but *before* its Python `refund` ran would leak global-counter capacity for up to one minute (until the bucket auto-rolls). This briefly under-counts available capacity — i.e., the dialler sheds slightly more than it should — which is the safe direction. Acceptable; not a correctness bug.
+7. **`/metrics` has no authentication.** Mounted at the root of the API; mounted-with-auth would be one decorator addition. Documented in §12.
+8. **`tests/test_post_call_pipeline.py` end-to-end through Celery is mocked, not real.** The pipeline is driven by calling `_run_stage_async` directly with a stubbed `run_stage.apply_async`. Running against a live Celery worker pool would catch wiring issues this test path can't (queue routing typos, serialiser mismatches). Acceptable for the assessment; production would add a smoke test against a deployed worker.
+9. **`src/models/` SQLAlchemy ORM classes are vestigial.** The pipeline uses raw SQL via `text(...)` everywhere because the JSONB merge patterns are awkward through the ORM and the queries are stable. The models are kept as schema documentation; they have no runtime references.
 
 ---
 
 ## 15. What I Would Do With More Time
 
-_Detail in Phase 6._
+Prioritised. The first three are the ones I'd ship next; everything below the line is real but lower-leverage.
 
-1. _to be filled in_
+1. **Encryption at rest, end to end.** Wire SSE-KMS on the recording bucket, pgcrypto on transcripts and lead PII, KMS bootstrap and rotation. Concrete next step: a migration that reads existing `interactions.conversation_data` rows in batches, encrypts them, writes back; followed by application-side reads going through the decrypt path. Estimated 1.5–2 days including operational tooling.
+2. **Real end-to-end test against a live Celery worker** for `tests/test_post_call_pipeline.py`. Spin up a Celery worker as part of the test fixture, run the full burst through `apply_async` instead of `_run_stage_async`. Catches queue-routing typos and serialisation issues. Half a day.
+3. **Operator dashboard over `audit_events`.** A small Flask/FastAPI admin app with one page: "find an interaction by ID, see its complete timeline". This is the most useful tool the on-call doesn't have today. Half a day.
+4. **CRM push action tracking.** `signal_action_attempts` table per §14 item 2. Adds the action-level retry/dead state machine that today is implicit in the stage-level one. One day.
+5. **Triage stage A measurement.** Instrument the keyword classifier to record per-disposition match rate against actual analysis outcomes (Stage A says hot, did the LLM agree?). Drives both pattern tuning and the eventual decision to replace Stage A with a small LLM. Half a day to instrument; production data drives the conclusions.
+6. **Per-customer no-deploy admin UI.** Lives inside the operator dashboard from item 3; one form per customer to edit `customer_budgets` (reserved tpm/rpm, priority_weight, customer_overrides). Audit every write. One day.
+7. **Stage B Bayesian calibration.** Right now Stage A's confidence threshold is hardcoded; Stage B's outcome bypasses it. Given enough data, a calibration step (Platt-scaling on Stage A confidences) would reduce Stage B invocations on transcripts where Stage A is *probably* right but didn't clear the gate. Cost is ~50 tokens × ambiguous-rate × campaign size, so the savings scale.
+8. **Per-region rate limiter.** If we ever fan out to multiple regions, the global Redis becomes a coordination chokepoint. A two-tier limiter — per-region buckets that periodically reconcile against a global budget — keeps the fast path local. Real but only matters at multi-region scale.
+9. **Adaptive backoff schedule for the recording poller.** Today's schedule is static (5/10/20/40/80s). Recording delivery time is bimodal (fast under load light, slow under load heavy); an adaptive schedule that learns the recent delivery distribution would reduce wasted polls under normal load. Marginal win.
+
+The shape of the prioritisation: **observability and correctness first** (1, 2, 3, 4), then **measurement and tuning** (5, 7, 9), then **multi-region scale** (8), then **convenience UI** (6). Items low on the list are still real work — but they pay off later or in narrower conditions, and the load-bearing items above them deserve the next engineer's attention first.
