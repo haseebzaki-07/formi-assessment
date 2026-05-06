@@ -143,7 +143,11 @@ async def test_short_transcript_skip_enforced_in_worker():
 
     short_payload = _payload(transcript_turns=2)
     with pytest.raises(_SkipStage) as exc:
-        await _do_analysis(str(uuid4()), short_payload)
+        await _do_analysis(
+            interaction_id=str(uuid4()),
+            job_id=str(uuid4()),
+            payload=short_payload,
+        )
     assert exc.value.reason == "short_transcript"
 
 

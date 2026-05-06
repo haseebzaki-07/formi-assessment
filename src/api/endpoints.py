@@ -33,14 +33,16 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.services import job_store
+from src.services import job_store, triage
 from src.services.job_store import (
     STAGE_ANALYSIS,
     STAGE_LEAD_STAGE,
     STAGE_RECORDING,
     STAGE_SIGNAL_JOBS,
 )
-from src.tasks.celery_tasks import run_stage
+from src.services.triage import LANE_SKIP
+from src.tasks.celery_tasks import queue_for_lane, run_stage
+from src.tasks.recording_poller import poll_recording
 from src.utils.db import async_session_factory
 from src.utils.logging import correlation_context, write_audit_event
 
@@ -81,11 +83,25 @@ async def end_interaction(
             transcript = interaction.get("conversation_data", {}).get(
                 "transcript", []
             )
-            is_short = len(transcript) < 4
             transcript_text = "\n".join(
                 f"{turn.get('role', 'unknown')}: {turn.get('content', '')}"
                 for turn in transcript
             )
+
+            # Phase 3: triage runs at pipeline-creation time. Skip lane is
+            # treated identically to a short transcript — analysis is
+            # short-circuited to a `skipped` row and downstream stages
+            # proceed without an LLM call (AC8). Hot vs cold drives queue
+            # routing and scheduling priority on the analysis stage.
+            async with async_session_factory() as db_overrides:
+                customer_overrides = await job_store.get_customer_overrides(
+                    db_overrides, customer_id=interaction["customer_id"],
+                )
+            triage_result = await triage.classify(
+                transcript, customer_overrides=customer_overrides,
+            )
+            is_skip = triage_result.is_skip or len(transcript) < 4
+            has_long_transcript = not is_skip
 
             payload = {
                 "interaction_id": str(interaction_id),
@@ -100,6 +116,8 @@ async def end_interaction(
                 "additional_data": request.additional_data or {},
                 "ended_at": datetime.utcnow().isoformat(),
                 "exotel_account_id": interaction.get("exotel_account_id"),
+                "lane": triage_result.lane,
+                "triage_disposition": triage_result.disposition,
             }
 
             # Single transaction: status update + pipeline rows + audit event.
@@ -119,7 +137,10 @@ async def end_interaction(
                     customer_id=interaction["customer_id"],
                     campaign_id=interaction["campaign_id"],
                     payload=payload,
-                    has_long_transcript=not is_short,
+                    has_long_transcript=has_long_transcript,
+                    lane=triage_result.lane,
+                    priority=triage_result.priority,
+                    cold_defer_seconds=settings.COLD_LANE_DEFER_SECONDS,
                 )
                 await write_audit_event(
                     db,
@@ -127,31 +148,47 @@ async def end_interaction(
                     event_type="pipeline_created",
                     customer_id=interaction["customer_id"],
                     campaign_id=interaction["campaign_id"],
-                    is_short_transcript=is_short,
+                    is_short_transcript=is_skip,
                     stages=list(job_ids.keys()),
                     transcript_turns=len(transcript),
+                    lane=triage_result.lane,
+                    priority=triage_result.priority,
+                    triage_disposition=triage_result.disposition,
+                    triage_confidence=triage_result.confidence,
+                    triage_stage=triage_result.stage_used,
                 )
                 await db.commit()
 
             entry_stages = (
                 [STAGE_RECORDING, STAGE_SIGNAL_JOBS, STAGE_LEAD_STAGE]
-                if is_short
+                if is_skip
                 else [STAGE_RECORDING, STAGE_ANALYSIS]
             )
             for stage in entry_stages:
                 if stage not in job_ids:
                     continue
-                run_stage.apply_async(
-                    args=[str(job_ids[stage]), stage],
-                    queue=settings.POSTCALL_CELERY_QUEUE,
-                )
+                # Recording runs on its own long-lived poll loop (Phase 4)
+                # instead of the generic run_stage dispatcher.
+                if stage == STAGE_RECORDING:
+                    poll_recording.apply_async(
+                        args=[str(job_ids[stage])],
+                        queue=settings.RECORDING_POLL_QUEUE,
+                    )
+                else:
+                    run_stage.apply_async(
+                        args=[str(job_ids[stage]), stage],
+                        queue=queue_for_lane(triage_result.lane, stage),
+                    )
 
             logger.info(
                 "pipeline_dispatched",
                 extra={
                     "interaction_id": str(interaction_id),
-                    "is_short_transcript": is_short,
+                    "is_short_transcript": is_skip,
                     "entry_stages": entry_stages,
+                    "lane": triage_result.lane,
+                    "priority": triage_result.priority,
+                    "triage_disposition": triage_result.disposition,
                 },
             )
 
