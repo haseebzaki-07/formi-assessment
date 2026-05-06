@@ -41,15 +41,19 @@ class Settings:
     RECORDING_WAIT_SECONDS: int = 45
     S3_BUCKET: str = os.getenv("S3_BUCKET", "voicebot-recordings")
 
-    # ── Circuit breaker ───────────────────────────────────────────────────────
-    # When LLM usage hits 90% of capacity, the circuit breaker trips and the
-    # dialler freezes for 30 minutes. This was meant to prevent 429s.
-    # In practice it just means the dialler stops making calls while the LLM
-    # queue drains — business impact: zero new calls for half an hour.
+    # ── Backpressure (Phase 5) ────────────────────────────────────────────────
+    # The previous binary circuit breaker (90% utilisation → 1800s freeze of
+    # the dialler) was deleted in Phase 5. It is replaced by a continuous
+    # signal in src/services/backpressure.py: dialler_dispatch_probability
+    # is a smooth shed curve over current LLM utilisation. There is no
+    # freeze duration to misjudge — utilisation is read fresh on every
+    # dispatch tick and dispatch probability tracks it directly.
     #
-    # 1800 seconds = 30 minutes. The sales team noticed before the engineers did.
-    CIRCUIT_BREAKER_CAPACITY_THRESHOLD: float = 0.90
-    CIRCUIT_BREAKER_FREEZE_SECONDS: int = 1800
+    # Alert thresholds (consumed by /metrics scrape, not by the app itself):
+    #   utilization >= 0.75 → warn
+    #   utilization >= 0.90 → page
+    BACKPRESSURE_WARN_UTILIZATION: float = 0.75
+    BACKPRESSURE_PAGE_UTILIZATION: float = 0.90
 
     # ── Post-call processing ──────────────────────────────────────────────────
     # Single queue. Everything goes here. A "not interested" 10-second call
@@ -57,6 +61,45 @@ class Settings:
     POSTCALL_CELERY_QUEUE: str = "postcall_processing"
     POSTCALL_MAX_RETRIES: int = 3
     POSTCALL_RETRY_DELAY: int = 60  # Fixed delay — not exponential backoff
+
+    # ── Phase 3: Hot / cold lanes ─────────────────────────────────────────────
+    # Triage routes work into two analysis queues. Operators size workers
+    # per queue: more hot workers for tight latency, fewer cold workers
+    # tolerating backlog. The default queue (POSTCALL_CELERY_QUEUE above)
+    # is retained as the destination for lane-agnostic stages (signal_jobs
+    # and lead_stage) so they don't compete with analysis for slots.
+    POSTCALL_HOT_QUEUE: str = "postcall_hot"
+    POSTCALL_COLD_QUEUE: str = "postcall_cold"
+    # Cold-lane analysis is deferred to a low-utilisation window. Default
+    # zero means "process as soon as a cold worker is free"; raise this to
+    # actively batch cold work into off-peak periods.
+    COLD_LANE_DEFER_SECONDS: int = int(os.getenv("COLD_LANE_DEFER_SECONDS", "0"))
+    # Reservation sizes used as a hint by the analysis stage (Phase 2's
+    # rate limiter consumes these when wiring up). Hot lane gets the full
+    # prompt / reservation; cold lane uses a cheaper summary-only prompt.
+    HOT_LANE_RESERVATION_TOKENS: int = int(
+        os.getenv("HOT_LANE_RESERVATION_TOKENS", "1500")
+    )
+    COLD_LANE_RESERVATION_TOKENS: int = int(
+        os.getenv("COLD_LANE_RESERVATION_TOKENS", "500")
+    )
+
+    # ── Phase 4: Recording poller ─────────────────────────────────────────────
+    # The recording stage runs as a long-lived in-job poll loop instead of
+    # per-attempt Celery redeliveries. Backoff is jittered exponential — see
+    # src/tasks/recording_poller.py for the schedule.
+    RECORDING_POLL_QUEUE: str = "recording_poll"
+    # Backoff schedule in seconds. Each entry is the delay BEFORE the next
+    # poll. Total wall-clock budget = sum of all entries (default ≈ 155s,
+    # which exceeds the 120s tail of Exotel's normal delivery window).
+    RECORDING_POLL_BACKOFF_SCHEDULE: tuple = (5, 10, 20, 40, 80)
+    # Jitter as a fraction of the scheduled delay. 0.2 = ±20%.
+    RECORDING_POLL_JITTER: float = 0.2
+    # Reconciliation beat: scan for stuck recording rows every 60s.
+    RECORDING_RECONCILE_INTERVAL_SECONDS: int = 60
+    # A leased recording row older than this is considered stuck (worker
+    # crash mid-upload) — the reconciler resets state to pending.
+    RECORDING_STUCK_AFTER_SECONDS: int = 300
 
 
 settings = Settings()

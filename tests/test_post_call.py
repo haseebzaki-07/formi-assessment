@@ -13,6 +13,15 @@ from datetime import datetime
 from src.services.post_call_processor import PostCallProcessor, PostCallContext
 
 
+@pytest.mark.skip(
+    reason=(
+        "Documents pre-Phase-2 behaviour. Phase 2 wrapped process_post_call "
+        "in a rate-limit reservation, requires a job_id, and renamed "
+        "_update_interaction_metadata; Phase 3 introduced the triage step "
+        "this test predates. Phase 6 replaces this file with "
+        "tests/test_post_call_pipeline.py covering the new pipeline."
+    )
+)
 @pytest.mark.asyncio
 async def test_every_call_gets_full_llm_analysis(make_post_call_context):
     """
@@ -95,20 +104,7 @@ async def test_recording_blocks_processing(make_post_call_context):
     assert True  # Documenting the 45s blocking sleep
 
 
-@pytest.mark.asyncio
-async def test_circuit_breaker_freezes_dialler():
-    """
-    CURRENT BEHAVIOUR: When post-call LLM usage >= 90%, the circuit breaker
-    freezes ALL outbound dialling for the agent for 1800 seconds.
-    No gradual backpressure, no per-campaign granularity.
-    """
-    from src.services.circuit_breaker import PostCallCircuitBreaker
-
-    breaker = PostCallCircuitBreaker()
-    breaker._capacity_threshold = 0.90
-    breaker._freeze_seconds = 1800
-
-    # If we could mock Redis to return RPM at 91% of max,
-    # the breaker would trip and freeze ALL calls for that agent
-    assert breaker._freeze_seconds == 1800
-    assert breaker._capacity_threshold == 0.90
+# NOTE: test_circuit_breaker_freezes_dialler was removed in Phase 5 along
+# with src/services/circuit_breaker.py itself. The replacement module is
+# src/services/backpressure.py — its smooth-shed behaviour is exercised
+# in tests/test_backpressure.py.

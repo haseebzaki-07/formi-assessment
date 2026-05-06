@@ -23,17 +23,21 @@ There is no linter or formatter configured. The existing tests in `tests/test_po
 
 ## Implementation status
 
-Work is being done in phases (see plan file). **Phase 1 — durable execution + recording fan-out — has landed.** The sections below describe the *original* broken architecture for context; the bullets here describe what's actually in the tree right now.
+Work is being done in phases (see plan file). **Phases 1–5 have landed.** The sections below describe the *original* broken architecture for context; the bullets here describe what's actually in the tree right now.
 
 - `processing_jobs` and `audit_events` tables exist (in `data/schema.sql`); they're the durable source of truth for pipeline state, not the Celery broker.
-- `src/services/job_store.py` is the repository layer (`create_pipeline`, `lease_job`, `lease_next`, `complete_job`, `fail_job`, `mark_skipped`, `reap_stale_leases`). Idempotency is on `(interaction_id, stage)`; the conditional UPDATE with `lease_token` makes late completions from crashed workers a no-op.
+- `src/services/job_store.py` is the repository layer (`create_pipeline`, `lease_job`, `lease_next`, `complete_job`, `fail_job`, `defer_job`, `mark_skipped`, `reap_stale_leases`). Idempotency is on `(interaction_id, stage)`; the conditional UPDATE with `lease_token` makes late completions from crashed workers a no-op.
 - `src/tasks/celery_tasks.py` is one `run_stage` dispatcher that leases the row, executes the stage handler, and either completes (auto-dispatching newly-unblocked dependents) or fails (with retry/dead state-machine semantics). The old monolithic `process_interaction_end_background_task` is gone.
-- `src/services/recording.py` no longer sleeps 45s. It raises `RecordingNotReady` on 404, which surfaces as a job retry. Phase 4 will replace per-job retries with a long-lived poller stage.
+- `src/services/recording.py` is poll-friendly; recording is now a long-lived poller stage in `src/tasks/recording_poller.py` with jittered exponential backoff.
 - `src/services/retry_queue.py` is deleted. The processing_jobs state machine replaces it.
 - `src/utils/logging.py` provides `correlation_context(...)` (auto-injects `interaction_id` into every log call inside the block) and `write_audit_event(...)` (writes a row to `audit_events` in the caller's transaction).
 - `src/api/endpoints.py` no longer fires duplicate empty-payload signal_jobs / update_lead_stage. Both are now durable stages on the worker pipeline.
+- `src/services/rate_limiter.py` + `src/services/budget.py` (Phase 2): atomic Redis-Lua reservations with per-customer reserved + global spillover, multiplicative-decrease 429 backoff, append-only `token_usage` ledger.
+- `src/services/triage.py` (Phase 3): keyword/regex stage A + cheap-LLM stage B; the `lane` and `priority` columns on `processing_jobs` route work to `postcall_hot`, `postcall_cold`, or the default queue.
+- `src/services/backpressure.py` (Phase 5): continuous `current_utilization()` from the rate-limiter's global aggregate counters; smooth `dialler_dispatch_probability` curve (1 − sigmoid centred at 0.7 utilisation). `src/services/circuit_breaker.py` is **deleted** — the binary 1800s freeze is gone.
+- `src/api/metrics.py` (Phase 5): Prometheus `/metrics` endpoint exposing `llm_utilization`, `dialler_dispatch_probability`, raw TPM/RPM aggregates, and per-`(customer_id, state)` queue depth.
 
-Remaining work tracked in the phase plan: rate-limit-aware scheduling (Phase 2), hot/cold lanes (Phase 3), recording poller + alerts (Phase 4), continuous backpressure (Phase 5), test polish + SUBMISSION.md finalization (Phase 6). The endpoint's `_load_interaction` / `_update_interaction_status` are still mocks — wiring them to Postgres is not load-bearing for Phase 1's guarantees.
+Remaining work: test polish + SUBMISSION.md finalisation (Phase 6). The endpoint's `_load_interaction` / `_update_interaction_status` are wired to Postgres now (Phase 0/1).
 
 ## Architecture (current, broken)
 
