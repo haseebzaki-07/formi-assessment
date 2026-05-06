@@ -79,6 +79,101 @@ CREATE INDEX idx_interactions_customer ON interactions(customer_id);
 CREATE INDEX idx_interactions_call_sid ON interactions(call_sid);
 CREATE INDEX idx_interactions_status ON interactions(status);
 
+-- ─── Phase 1: Durable execution ────────────────────────────────────────────
+-- processing_jobs is the source of truth for post-call pipeline state. One
+-- row per (interaction, stage). The Celery broker is the executor; this table
+-- is the durable record. A worker crash leaves the row in 'leased' until the
+-- lease expires, after which any worker can pick it up via lease_next_stage.
+CREATE TABLE processing_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID NOT NULL,
+    customer_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+
+    -- Pipeline stage. recording and analysis run in parallel; signal_jobs and
+    -- lead_stage depend on analysis completing (depends_on_job_id).
+    stage VARCHAR(32) NOT NULL,
+
+    -- pending → leased → completed | failed → (retry: pending) | dead | skipped
+    state VARCHAR(16) NOT NULL DEFAULT 'pending',
+
+    -- Lower number = more urgent. Default 5 = normal. Phase 3 will set 1 for
+    -- hot lane, 9 for cold lane.
+    priority SMALLINT NOT NULL DEFAULT 5,
+    lane VARCHAR(16),
+
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+
+    -- Optimistic lease: a worker writes lease_token on lease, and every
+    -- subsequent state transition checks WHERE lease_token = $1. A second
+    -- worker that picks up the same row after lease expiry gets a different
+    -- token, so the original worker's late completion is a no-op.
+    lease_token UUID,
+    leased_at TIMESTAMPTZ,
+    lease_expires_at TIMESTAMPTZ,
+    worker_id VARCHAR(128),
+
+    payload JSONB NOT NULL DEFAULT '{}',
+    result JSONB,
+    last_error TEXT,
+
+    -- scheduled_at is when this stage becomes eligible. Phase 2's rate
+    -- limiter pushes this forward when budget is exhausted; Phase 3's cold
+    -- lane uses it for batched-window deferral.
+    scheduled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    depends_on_job_id UUID REFERENCES processing_jobs(id),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Idempotency at the table level: one (interaction, stage) row, ever. A
+-- duplicate webhook delivery cannot create a second pipeline.
+CREATE UNIQUE INDEX uq_processing_jobs_interaction_stage
+    ON processing_jobs(interaction_id, stage);
+
+-- Lease-next-pending query: state='pending' AND scheduled_at <= now ORDER BY
+-- priority, scheduled_at. Partial index keeps it small at 100K-row scale.
+CREATE INDEX idx_processing_jobs_pending
+    ON processing_jobs(stage, priority, scheduled_at)
+    WHERE state = 'pending';
+
+-- Find stale leases (worker crashed mid-stage) for the reaper.
+CREATE INDEX idx_processing_jobs_leased
+    ON processing_jobs(lease_expires_at)
+    WHERE state = 'leased';
+
+-- Per-customer queue depth and active-work queries.
+CREATE INDEX idx_processing_jobs_customer_state
+    ON processing_jobs(customer_id, state);
+
+CREATE INDEX idx_processing_jobs_interaction
+    ON processing_jobs(interaction_id);
+
+-- audit_events is append-only. Every state transition and external-system
+-- interaction (LLM call, recording fetch, signal job dispatch) writes a row.
+-- This is the table an on-call engineer queries to debug a specific
+-- interaction 3 days later (AC5).
+CREATE TABLE audit_events (
+    id BIGSERIAL PRIMARY KEY,
+    interaction_id UUID NOT NULL,
+    correlation_id UUID NOT NULL,
+    customer_id UUID,
+    campaign_id UUID,
+    job_id UUID,
+    stage VARCHAR(32),
+    event_type VARCHAR(64) NOT NULL,
+    severity VARCHAR(8) NOT NULL DEFAULT 'info',
+    details JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_events_interaction ON audit_events(interaction_id, created_at);
+CREATE INDEX idx_audit_events_correlation ON audit_events(correlation_id, created_at);
+CREATE INDEX idx_audit_events_type ON audit_events(event_type, created_at);
+CREATE INDEX idx_audit_events_customer ON audit_events(customer_id, created_at);
+
 -- Seed data: sample interactions for testing
 -- (Uses fixed UUIDs for reproducibility)
 
