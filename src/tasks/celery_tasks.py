@@ -1,189 +1,479 @@
 """
-Celery tasks for post-call processing.
+Celery tasks for post-call processing — durable, per-stage execution.
 
-This is the main background processing pipeline. Every completed interaction
-with a long transcript ends up here.
+The pipeline is data-driven: processing_jobs rows define what work exists
+and what depends on what. Celery is the executor — it delivers a "go work
+on job X" message and the worker leases the row, executes, and either
+completes (unblocking dependents) or fails (with retry/dead semantics).
 
-The task runs five steps sequentially:
-    1. Wait 45s, try to fetch recording from Exotel → upload to S3
-    2. Run full LLM analysis on the transcript
-    3. Write result to interaction_metadata (dashboard cache)
-    4. Trigger signal jobs (downstream actions: WhatsApp, callbacks, etc.)
-    5. Update lead stage
+Why one dispatcher task instead of one task per stage?
+  Routing stays in the data, not in Celery. Phase 3 will add hot/cold lanes
+  by setting `queue` based on the job's `lane` column, without restructuring
+  the task definitions here.
 
-A few things worth understanding before you start changing things:
-
-WHY CELERY + REDIS?
-  We needed a task queue and Celery was already in the stack. Redis was already
-  in the stack. It worked fine at 1K calls/day. At 100K calls/campaign the cracks
-  show: broker restarts lose tasks, queue depth is invisible, and there's no way
-  to see which step a given interaction is stuck on.
-
-WHY ONE QUEUE?
-  Originally there was only one customer. One queue was fine. We never revisited
-  it when the platform became multi-customer. Now a campaign for Customer A can
-  fill the queue and delay Customer B's results by hours.
-
-WHY DOES RECORDING BLOCK ANALYSIS?
-  It shouldn't. Recording upload and LLM analysis are completely independent —
-  the LLM reads the transcript, not the audio file. But they're sequential here
-  because that's how the task was originally written and nobody had a reason to
-  split them until the 45-second sleep became a visible SLA problem.
-
-  Think about what "run them in parallel" would require at the infrastructure level.
+What changed from the old monolithic task:
+  - asyncio.sleep(45) is gone. Recording is its own job, runs in parallel
+    with analysis, retries via the job state machine instead of blocking.
+  - Short-transcript skip is enforced inside the worker (AC8). The endpoint
+    creates the analysis stage as `skipped`, but the worker also defends in
+    case a redelivery races the state.
+  - Failure modes: every stage exit emits an audit_events row in the same
+    transaction as the state change. Crashes mid-stage leave the row in
+    `leased` state; the lease expires and reap_stale_leases re-queues it.
+  - No more PostCallRetryQueue (Redis). The processing_jobs state machine
+    IS the retry queue, and lives in Postgres alongside the job payload.
 """
 
 import asyncio
 import logging
+import os
+import socket
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
+from sqlalchemy import text
+
+from src.config import settings
 from src.tasks.celery_app import celery_app
-from src.services.post_call_processor import PostCallProcessor, PostCallContext
+from src.utils.db import async_session_factory
+from src.utils.logging import (
+    configure_logging,
+    correlation_context,
+    write_audit_event,
+)
+from src.services import job_store
+from src.services.job_store import (
+    STAGE_ANALYSIS,
+    STAGE_LEAD_STAGE,
+    STAGE_RECORDING,
+    STAGE_SIGNAL_JOBS,
+)
+from src.services.post_call_processor import PostCallContext, PostCallProcessor
 from src.services.recording import fetch_and_upload_recording
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
-from src.services.retry_queue import retry_queue
-from src.services.metrics import metrics_tracker
 
 logger = logging.getLogger(__name__)
+configure_logging()
 
 
-@celery_app.task(
-    name="process_interaction_end_background_task",
-    bind=True,
-    max_retries=3,
-    default_retry_delay=60,  # Fixed 60s — no exponential backoff
-    acks_late=True,           # Task only acked after completion, not on receipt.
-                              # This means a worker crash causes redelivery — good.
-                              # But "redelivery" goes to the back of the queue,
-                              # which at 100K depth means hours of extra wait.
-    queue="postcall_processing",
-)
-def process_interaction_end_background_task(self, payload: Dict[str, Any]):
-    """
-    Main Celery task. Called for every long-transcript interaction.
+class _SkipStage(Exception):
+    """Raised inside a stage handler to mark the job skipped (not failed)."""
 
-    Celery workers are synchronous by default, so we spin up an event loop
-    per task to run the async processing code. This means each Celery worker
-    process handles one interaction at a time — no concurrency within a worker.
+    def __init__(self, reason: str, result_payload: Optional[Dict[str, Any]] = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.result_payload = result_payload or {}
 
-    At 100K interactions/campaign with ~3,500ms LLM latency per call:
-        100,000 × 3.5s = 350,000 worker-seconds needed
-        With 10 workers: ~9.7 hours to drain the queue
 
-    If your campaign window is 8 hours, you're already behind before you start.
-    """
+def _worker_id() -> str:
+    return f"{socket.gethostname()}-{os.getpid()}"
+
+
+def _run_async(coro):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
     try:
-        loop.run_until_complete(_process_interaction(self, payload))
-    except Exception as e:
-        logger.exception(
-            "celery_task_failed",
-            extra={
-                "interaction_id": payload.get("interaction_id"),
-                "error": str(e),
-                "attempt": self.request.retries,
-            },
-        )
-        # Failed tasks go into PostCallRetryQueue (Redis) AND Celery retries.
-        # Two retry mechanisms that don't know about each other. An interaction
-        # can end up being processed twice if both fire.
-        loop.run_until_complete(
-            retry_queue.enqueue_retry(
-                interaction_id=payload["interaction_id"],
-                error=str(e),
-                payload=payload,
-            )
-        )
-        raise self.retry(exc=e)
+        return loop.run_until_complete(coro)
     finally:
         loop.close()
 
 
-async def _process_interaction(task, payload: Dict[str, Any]):
-    interaction_id = payload["interaction_id"]
+@celery_app.task(
+    name="run_stage",
+    bind=True,
+    acks_late=True,
+    queue=settings.POSTCALL_CELERY_QUEUE,
+)
+def run_stage(self, job_id: str, stage: str) -> None:
+    """
+    Lease a specific job row and execute its stage. Idempotent across
+    redeliveries — the lease check makes a stale Celery message a no-op.
+    """
+    _run_async(_run_stage_async(job_id, stage))
 
-    await metrics_tracker.track_processing_started(interaction_id)
+
+async def _run_stage_async(job_id: str, stage: str) -> None:
+    async with async_session_factory() as session:
+        leased = await job_store.lease_job(
+            session, job_id=job_id, worker_id=_worker_id(),
+        )
+        if leased is None:
+            await session.commit()
+            logger.info(
+                "stage_lease_skipped",
+                extra={"job_id": job_id, "stage": stage},
+            )
+            return
+
+        interaction_id = str(leased["interaction_id"])
+        lease_token = str(leased["lease_token"])
+        customer_id = str(leased["customer_id"])
+        campaign_id = str(leased["campaign_id"])
+
+        await write_audit_event(
+            session,
+            interaction_id=interaction_id,
+            event_type="stage_leased",
+            stage=stage,
+            customer_id=customer_id,
+            campaign_id=campaign_id,
+            job_id=job_id,
+            attempt=leased["attempts"],
+            worker_id=_worker_id(),
+        )
+        await session.commit()
+
+    with correlation_context(interaction_id):
+        try:
+            payload = leased["payload"] or {}
+            if stage == STAGE_RECORDING:
+                result_payload = await _do_recording(payload)
+            elif stage == STAGE_ANALYSIS:
+                result_payload = await _do_analysis(interaction_id, payload)
+            elif stage == STAGE_SIGNAL_JOBS:
+                result_payload = await _do_signal_jobs(
+                    interaction_id, payload,
+                )
+            elif stage == STAGE_LEAD_STAGE:
+                result_payload = await _do_lead_stage(interaction_id, payload)
+            else:
+                raise ValueError(f"unknown stage: {stage}")
+
+        except _SkipStage as skip:
+            await _finalize_skipped(
+                job_id=job_id,
+                lease_token=lease_token,
+                interaction_id=interaction_id,
+                customer_id=customer_id,
+                campaign_id=campaign_id,
+                stage=stage,
+                reason=skip.reason,
+                result_payload=skip.result_payload,
+            )
+            return
+
+        except Exception as exc:
+            logger.exception(
+                "stage_exception",
+                extra={"job_id": job_id, "stage": stage},
+            )
+            await _finalize_failed(
+                job_id=job_id,
+                lease_token=lease_token,
+                interaction_id=interaction_id,
+                customer_id=customer_id,
+                campaign_id=campaign_id,
+                stage=stage,
+                error=str(exc),
+                attempts=leased["attempts"],
+                max_attempts=leased["max_attempts"],
+            )
+            return
+
+        await _finalize_completed(
+            job_id=job_id,
+            lease_token=lease_token,
+            interaction_id=interaction_id,
+            customer_id=customer_id,
+            campaign_id=campaign_id,
+            stage=stage,
+            result_payload=result_payload,
+        )
+
+
+# ── Stage handlers ─────────────────────────────────────────────────────────
+# Each returns the dict that becomes processing_jobs.result. Raise to fail.
+# Raise _SkipStage to skip without consuming an attempt.
+
+async def _do_recording(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Single-shot recording fetch. The asyncio.sleep(45) is gone — if the
+    recording isn't ready yet, fetch_and_upload_recording raises
+    RecordingNotReady which becomes a retried job failure (3 attempts, 60s
+    apart by default). Phase 4 replaces this with a long-lived polling
+    stage that does its own exponential backoff inside the job, avoiding
+    Celery dispatch overhead per poll.
+    """
+    s3_key = await fetch_and_upload_recording(
+        interaction_id=payload.get("interaction_id") or "",
+        call_sid=payload.get("call_sid") or "",
+        exotel_account_id=payload.get("exotel_account_id") or "",
+    )
+    return {"s3_key": s3_key}
+
+
+async def _do_analysis(
+    interaction_id: str, payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    LLM analysis. Re-checks short-transcript at the worker (AC8) — even if
+    the endpoint missed the fast path (e.g., a duplicate redelivery races
+    the state), the worker won't burn LLM quota on a 3-turn transcript.
+
+    Phase 2 will wrap this with a rate-limit reservation. For now it calls
+    the LLM unconditionally (the existing mock returns a fixed result).
+    """
+    transcript = payload.get("conversation_data", {}).get("transcript", [])
+    if len(transcript) < 4:
+        raise _SkipStage(
+            reason="short_transcript",
+            result_payload={"call_stage": "short_call", "skipped": True},
+        )
 
     ctx = PostCallContext(
         interaction_id=interaction_id,
-        session_id=payload["session_id"],
-        lead_id=payload["lead_id"],
-        campaign_id=payload["campaign_id"],
-        customer_id=payload["customer_id"],
-        agent_id=payload["agent_id"],
+        session_id=payload.get("session_id", ""),
+        lead_id=payload.get("lead_id", ""),
+        campaign_id=payload.get("campaign_id", ""),
+        customer_id=payload.get("customer_id", ""),
+        agent_id=payload.get("agent_id", ""),
         call_sid=payload.get("call_sid", ""),
         transcript_text=payload.get("transcript_text", ""),
         conversation_data=payload.get("conversation_data", {}),
         additional_data=payload.get("additional_data", {}),
-        ended_at=datetime.fromisoformat(payload["ended_at"]),
+        ended_at=datetime.fromisoformat(
+            payload["ended_at"]
+        ) if payload.get("ended_at") else datetime.utcnow(),
         exotel_account_id=payload.get("exotel_account_id"),
     )
-
-    # ── Step 1: Recording ─────────────────────────────────────────────────────
-    # Blocks here for ~45 seconds waiting for Exotel to make the recording
-    # available. The LLM analysis (step 2) cannot start until this completes,
-    # even though it has zero dependency on the recording.
-    #
-    # Under load, recordings often arrive in 10–15s. We wait 45s anyway.
-    # Sometimes they arrive after 60s. We've already given up by then.
-    recording_s3_key = await fetch_and_upload_recording(
-        interaction_id=ctx.interaction_id,
-        call_sid=ctx.call_sid,
-        exotel_account_id=ctx.exotel_account_id or "",
-    )
-
-    if recording_s3_key:
-        logger.info(
-            "recording_uploaded",
-            extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
-        )
-    # If recording_s3_key is None, we continue silently. No alert, no retry,
-    # no flag on the interaction. The recording is just gone.
-
-    # ── Step 2: LLM analysis ──────────────────────────────────────────────────
-    # Full analysis on every call. 1,500 tokens average. No pre-screening.
-    # A call where the customer said "wrong number" after one sentence gets the
-    # same treatment as a confirmed rebook.
-    #
-    # The LLM rate limit (settings.LLM_TOKENS_PER_MINUTE) is not checked before
-    # this call. If we're over the limit, the provider returns a 429 and this
-    # raises an exception, which triggers Celery retry — which goes to the back
-    # of the 100K-item queue and makes the problem worse.
     processor = PostCallProcessor()
     result = await processor.process_post_call(ctx, single_prompt=True)
+    return {
+        "call_stage": result.call_stage,
+        "entities": result.entities,
+        "summary": result.summary,
+        "tokens_used": result.tokens_used,
+        "latency_ms": result.latency_ms,
+        "raw_response": result.raw_response,
+    }
 
-    await metrics_tracker.track_processing_completed(
-        interaction_id, result.tokens_used, result.latency_ms
+
+async def _do_signal_jobs(
+    interaction_id: str, payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Read the analysis result from the parent job and dispatch downstream
+    actions. The analysis result is the parent (depends_on_job_id) job's
+    `result` column — read it inline rather than passing it through Celery,
+    so a stale message can't carry stale analysis.
+    """
+    analysis_result = await _read_analysis_result(
+        interaction_id, fallback_call_stage="processed"
     )
+    await trigger_signal_jobs(
+        interaction_id=interaction_id,
+        session_id=payload.get("session_id", ""),
+        campaign_id=payload.get("campaign_id", ""),
+        analysis_result=analysis_result,
+    )
+    return {"dispatched": True, "call_stage": analysis_result.get("call_stage")}
 
-    # ── Step 3: Signal jobs ───────────────────────────────────────────────────
-    # Downstream actions: send a WhatsApp follow-up, book a callback slot,
-    # push to the customer's CRM. These depend on knowing the analysis result.
-    #
-    # If this raises, we log a warning and continue — the lead stage still
-    # updates. But the downstream action (WhatsApp, callback, CRM push) is lost.
-    try:
-        await trigger_signal_jobs(
-            interaction_id=ctx.interaction_id,
-            session_id=ctx.session_id,
-            campaign_id=ctx.campaign_id,
-            analysis_result=result.raw_response,
-        )
-    except Exception as e:
-        logger.warning("signal_jobs_failed", extra={"error": str(e)})
 
-    # ── Step 4: Lead stage update ─────────────────────────────────────────────
-    # Updates the lead's stage in the leads table based on call_stage.
-    # e.g., "rebook_confirmed" → lead moves to "booked" stage.
-    # Same fire-and-forget risk as signal_jobs above.
-    try:
-        await update_lead_stage(
-            lead_id=ctx.lead_id,
-            interaction_id=ctx.interaction_id,
-            call_stage=result.call_stage,
+async def _do_lead_stage(
+    interaction_id: str, payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    analysis_result = await _read_analysis_result(
+        interaction_id, fallback_call_stage="processed"
+    )
+    call_stage = analysis_result.get("call_stage", "processed")
+    await update_lead_stage(
+        lead_id=payload.get("lead_id", ""),
+        interaction_id=interaction_id,
+        call_stage=call_stage,
+    )
+    return {"call_stage": call_stage}
+
+
+async def _read_analysis_result(
+    interaction_id: str, fallback_call_stage: str,
+) -> Dict[str, Any]:
+    """Look up the analysis stage row for this interaction and read its result.
+    If the analysis was skipped (short transcript), use the skipped result."""
+    async with async_session_factory() as session:
+        row = await session.execute(
+            text("""
+                SELECT result, state FROM processing_jobs
+                WHERE interaction_id = :interaction_id AND stage = :stage
+            """),
+            {"interaction_id": interaction_id, "stage": STAGE_ANALYSIS},
         )
-    except Exception as e:
-        logger.warning("lead_stage_update_failed", extra={"error": str(e)})
+        record = row.first()
+    if record is None or record.result is None:
+        return {"call_stage": fallback_call_stage}
+    return record.result
+
+
+# ── State-transition finalizers ────────────────────────────────────────────
+
+async def _finalize_completed(
+    *,
+    job_id: str,
+    lease_token: str,
+    interaction_id: str,
+    customer_id: str,
+    campaign_id: str,
+    stage: str,
+    result_payload: Dict[str, Any],
+) -> None:
+    async with async_session_factory() as session:
+        ok = await job_store.complete_job(
+            session,
+            job_id=job_id,
+            lease_token=lease_token,
+            result=result_payload,
+        )
+        if not ok:
+            await session.rollback()
+            logger.warning(
+                "complete_lost_race",
+                extra={"job_id": job_id, "stage": stage},
+            )
+            return
+        await write_audit_event(
+            session,
+            interaction_id=interaction_id,
+            event_type="stage_completed",
+            stage=stage,
+            customer_id=customer_id,
+            campaign_id=campaign_id,
+            job_id=job_id,
+            details=_safe_summary(result_payload),
+        )
+        dependents = await _newly_pending_dependents(session, parent_job_id=job_id)
+        await session.commit()
+
+    for dep in dependents:
+        run_stage.apply_async(
+            args=[str(dep["id"]), dep["stage"]],
+            queue=settings.POSTCALL_CELERY_QUEUE,
+        )
+
+
+async def _finalize_skipped(
+    *,
+    job_id: str,
+    lease_token: str,
+    interaction_id: str,
+    customer_id: str,
+    campaign_id: str,
+    stage: str,
+    reason: str,
+    result_payload: Dict[str, Any],
+) -> None:
+    async with async_session_factory() as session:
+        ok = await job_store.mark_skipped(
+            session,
+            job_id=job_id,
+            lease_token=lease_token,
+            reason=reason,
+            result_payload=result_payload,
+        )
+        if not ok:
+            await session.rollback()
+            return
+        await write_audit_event(
+            session,
+            interaction_id=interaction_id,
+            event_type="stage_skipped",
+            stage=stage,
+            customer_id=customer_id,
+            campaign_id=campaign_id,
+            job_id=job_id,
+            details={"reason": reason, **_safe_summary(result_payload)},
+        )
+        dependents = await _newly_pending_dependents(session, parent_job_id=job_id)
+        await session.commit()
+
+    for dep in dependents:
+        run_stage.apply_async(
+            args=[str(dep["id"]), dep["stage"]],
+            queue=settings.POSTCALL_CELERY_QUEUE,
+        )
+
+
+async def _finalize_failed(
+    *,
+    job_id: str,
+    lease_token: str,
+    interaction_id: str,
+    customer_id: str,
+    campaign_id: str,
+    stage: str,
+    error: str,
+    attempts: int,
+    max_attempts: int,
+) -> None:
+    async with async_session_factory() as session:
+        new_state = await job_store.fail_job(
+            session,
+            job_id=job_id,
+            lease_token=lease_token,
+            error=error,
+            retry_in_seconds=settings.POSTCALL_RETRY_DELAY,
+        )
+        if new_state is None:
+            await session.rollback()
+            return
+        severity = "warning" if new_state == "pending" else "error"
+        await write_audit_event(
+            session,
+            interaction_id=interaction_id,
+            event_type=(
+                "stage_failed_will_retry"
+                if new_state == "pending"
+                else "stage_dead"
+            ),
+            severity=severity,
+            stage=stage,
+            customer_id=customer_id,
+            campaign_id=campaign_id,
+            job_id=job_id,
+            error=error,
+            attempts=attempts,
+            max_attempts=max_attempts,
+        )
+        await session.commit()
+
+    if new_state == "pending":
+        run_stage.apply_async(
+            args=[str(job_id), stage],
+            queue=settings.POSTCALL_CELERY_QUEUE,
+            countdown=settings.POSTCALL_RETRY_DELAY,
+        )
+
+
+async def _newly_pending_dependents(session, *, parent_job_id: str):
+    result = await session.execute(
+        text("""
+            SELECT id, stage FROM processing_jobs
+            WHERE depends_on_job_id = :parent AND state = 'pending'
+        """),
+        {"parent": str(parent_job_id)},
+    )
+    return [dict(r._mapping) for r in result.all()]
+
+
+def _safe_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Trim large fields out of audit_events.details (raw_response can be big)."""
+    if not result:
+        return {}
+    keep = {"call_stage", "tokens_used", "latency_ms", "s3_key", "skipped"}
+    return {k: v for k, v in result.items() if k in keep}
+
+
+# ── Janitor: periodically reap stale leases (worker crashes) ──────────────
+
+@celery_app.task(name="reap_stale_leases", queue=settings.POSTCALL_CELERY_QUEUE)
+def reap_stale_leases_task() -> int:
+    """Run via Celery beat every 30s. Returns count of rows reaped — surface
+    to metrics so persistent worker churn is observable."""
+    return _run_async(_reap_async())
+
+
+async def _reap_async() -> int:
+    async with async_session_factory() as session:
+        count = await job_store.reap_stale_leases(session)
+        await session.commit()
+        if count > 0:
+            logger.warning("reaped_stale_leases", extra={"count": count})
+        return count
